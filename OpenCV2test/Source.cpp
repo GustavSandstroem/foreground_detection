@@ -4,12 +4,15 @@
 #include <ctime>
 #include <numeric>
 #include <fstream>
+#include <stdlib.h> 
 
 #include <opencv2\opencv.hpp>  
 #include <opencv2/core/core.hpp>  
 #include <opencv2/highgui/highgui.hpp>  
 #include <opencv2/video/background_segm.hpp>  
 #include <opencv2/imgproc/imgproc.hpp>
+
+
 
 #include "PFS.h"
 using namespace cv;  
@@ -159,9 +162,25 @@ Mat getGrabCutMask(Mat Mog_mask, Mat Mog_mask_shadow, Rect ROI){
  * \return the eucldian distance between two rect
  */
 double boxCenterOffset(Rect one, Rect two){
-	Point first(one.tl().x*(((1-one.br().x)/2)+1), one.br().y*(((1-one.tl().y)/2)+1));
-	Point second(two.tl().x*(((1-two.br().x)/2)+1), two.tl().y*(((1-two.tl().y)/2)+1));
+	Point first((one.tl().x+one.br().x)/2, (one.tl().y+one.br().y)/2);
+	Point second((two.tl().x+two.br().x)/2, (two.tl().y+two.br().y)/2);
 	return norm(first-second);
+}
+
+/*!
+ * \return the center of a box
+ */
+Point boxCenter(Rect one){
+	Point first((one.tl().x+one.br().x)/2, (one.tl().y+one.br().y)/2);
+	return first;
+}
+
+/*!
+ * \return the TL of a box
+ */
+Point boxTopLeft(Point center, Point heightwidth){
+	Point TL(center.x-(heightwidth.y/2), center.y-(heightwidth.x/2));
+	return TL;
 }
 
 /*!
@@ -217,25 +236,69 @@ vector<Rect> HOGdetectors(Mat image){
 	hog.detectMultiScale(image, found, 0, cv::Size(stride,stride), cv::Size(padding,padding), pyr_scale, use_mean_shift);
 	//hog.detectMultiScaleROI exist
 
-	for (int j=0;found.size()>j;j++){
-			Rect temp=enlargeROI(image, found[j], 10, 50);
-			found2.push_back(temp);
-			found2.push_back(temp);
+	int loop=found.size();
+	for (int j=0;loop>j;j++){
+			//Rect temp=enlargeROI(image, found[j], 10, 50);
+			//found2.push_back(temp);
+			//found2.push_back(temp);
+			found.push_back(found[j]);
 			//rectangle(boxF, temp, Scalar(0,255,0));
 		}
 
-		groupRectangles(found2, 1, 0.20);
+		groupRectangles(found, 1, 0.20);
 		//sort by top left in x
-		sort(found2.begin(), found2.end(), [](Rect a, Rect b){
+		sort(found.begin(), found.end(), [](Rect a, Rect b){
 			return b.tl().x < a.tl().x;
 		});
 
-		return found2;
+		return found;
 		//for (int u=0; ROIs.size() >u; u++){
 		//	rectangle(boxF, tempROI[u], Scalar(255,0,0));
 		//}
 		//imshow("hog detectors", boxF);
 }
+
+KalmanFilter initKalman(float x, float y)
+{
+    KalmanFilter KF(4, 2, 0);
+	KF.transitionMatrix = *(Mat_<float>(4, 4) << 1,0,1,0,   0,1,0,1,  0,0,1,0,  0,0,0,1);
+
+	// init...
+	KF.statePre.at<float>(0) = x;
+	KF.statePre.at<float>(1) = y;
+	KF.statePre.at<float>(2) = 0;
+	KF.statePre.at<float>(3) = 0;
+	KF.statePost.at<float>(0) = x;
+	KF.statePost.at<float>(1) = y;
+	KF.statePost.at<float>(2) = 0;
+	KF.statePost.at<float>(3) = 0;
+		
+
+	setIdentity(KF.measurementMatrix);
+	setIdentity(KF.processNoiseCov, Scalar::all(1e-4));
+	setIdentity(KF.measurementNoiseCov, Scalar::all(1e-1));
+	setIdentity(KF.errorCovPost, Scalar::all(.1));
+	return KF;
+
+}
+
+Point kalmanPredict(KalmanFilter KF) 
+{
+    Mat prediction = KF.predict();
+    Point predictPt(prediction.at<float>(0),prediction.at<float>(1));
+    return predictPt;
+}
+
+Point kalmanCorrect(KalmanFilter KF, float x, float y)
+{
+	Mat_<float> measurement(2,1); 
+    measurement(0) = x;
+    measurement(1) = y;
+    Mat estimated = KF.correct(measurement);
+    Point statePt(estimated.at<float>(0),estimated.at<float>(1));
+    return statePt;
+}
+
 
 void main(){
 	////MOG2
@@ -265,10 +328,11 @@ void main(){
 	int downsample_GRABCUT=4;
 	int max_detect=3;
 
-	VideoCapture stream("Data/Input/GUSTAV0002.MOV"); //%TODO can be made into an argument for fuction 
+	VideoCapture stream("Data/Input/GUSTAV0152.MOV"); //%TODO can be made into an argument for fuction 
 	if(!stream.isOpened()){
 		//return -1; //exit
 	}
+
 
 	//Grabcut
 	PFS foregroundclass;
@@ -290,6 +354,14 @@ void main(){
 	clock_t fps = 0;
 	vector<double> fpsarray;
 	int random=100;
+
+	//kalman stuff
+	vector<pair<KalmanFilter, KalmanFilter>> KF_bank;
+
+	vector<int> detections;
+
+	int match_thres= 100;
+
 
 	// unconditional loop
 	int fps_itter=0;
@@ -313,7 +385,83 @@ void main(){
 	   	//HOG detector
 		boxF=resizeF.clone();
 		vector<Rect> ROIs= HOGdetectors(resizeF);
+		for (int i=0; i<ROIs.size();i++){
+			rectangle(boxF, ROIs[i], Scalar(0,0,255));
+		}
+		//KALMAN
+		//First detection
+		if (ROIs.size()!=0 && KF_bank.empty()){
+			for (int i=0; i<ROIs.size(); i++){
+				cout << "filter initialized, current amout of filters are: "<< KF_bank.size() << endl;
+				KalmanFilter CTR=initKalman(boxCenter(ROIs[i]).x, boxCenter(ROIs[i]).y);
+				KalmanFilter HGT=initKalman(ROIs[i].height, ROIs[i].width);
+				KF_bank.push_back(pair<KalmanFilter,KalmanFilter>(CTR, HGT));
+			}
+		//No detections
+		}else if(ROIs.size()==0 && !KF_bank.empty()){
+			for (int i=0; i<KF_bank.empty(); i++){
+				Point a= kalmanPredict(KF_bank[i].first);
+				Point b= kalmanPredict(KF_bank[i].second);
+				detections[i]-=1;
 
+			}
+		//Match detection with previous OR IF NO MATCH create new 
+		}else if(ROIs.size()!=0 && !KF_bank.empty()){
+			for(int j=0; j<ROIs.size(); j++){
+				bool match=false;
+				for (int i=0; i<KF_bank.size();i++){
+					Point pred= kalmanPredict(KF_bank[i].first);
+					float dist =norm(boxCenter(ROIs[j])-pred);
+					if (dist < match_thres){
+						match=true;
+						detections[i]+=1;
+						Point a= kalmanCorrect(KF_bank[i].first , boxCenter(ROIs[i]).x, boxCenter(ROIs[i]).y);
+						Point b= kalmanCorrect(KF_bank[i].second, ROIs[i].height, ROIs[i].width);
+					}
+				}
+				if (!match){						
+					cout << "filter initialized, current amout of filters are: "<< KF_bank.size() << endl;
+					KalmanFilter CTR; 
+					KalmanFilter HGT;
+					CTR=initKalman(boxCenter(ROIs[j]).x, boxCenter(ROIs[j]).y);
+					HGT=initKalman(ROIs[j].height, ROIs[j].width);
+					KF_bank.push_back(pair<KalmanFilter,KalmanFilter>(CTR, HGT));
+
+				}
+			}
+
+		}
+		detections.resize(KF_bank.size());
+
+		if(fps_itter%30==0 && !KF_bank.empty()){
+			cout << "filter cleaning, initial size "<< KF_bank.size() << endl;
+			for(int i=0; i<KF_bank.size(); i++){
+				if (detections[i]<0){
+					cout << "hmm" << endl;
+					KF_bank.erase(KF_bank.begin()+i);
+				}
+			}
+			cout << " and the new size is: " << KF_bank.size() << endl;
+			for (int u=0; u<detections.size(); u++){
+				if (!(detections[u] <0)){
+				detections[u]=1;
+				}else{detections[u]=0;}
+			}
+		}
+
+		ROIs.empty();
+		for (int i=0; i<detections.size(); i++){
+			if (detections[i]>0){
+			Point a= kalmanPredict(KF_bank[i].first);
+			Point b= kalmanPredict(KF_bank[i].second);
+			Point topleft= boxTopLeft(a, b);
+			Rect  thisRect= Rect(topleft.x, topleft.y, b.y, b.x);
+			ROIs.push_back(enlargeROI(resizeF, thisRect, 1, 15));
+			rectangle(boxF, thisRect, Scalar(255,0,0));
+			}
+		}
+
+		imshow("Red is mesurments, Blue is Kalman filter bank" ,boxF);
 	   ////apply BS
 	   //pMOG2->operator()(resizeF, fgMaskMOG2, learnrate);  
 	   ////pGMG->operator()(resizeF, fgMaskMOG2);  
@@ -372,16 +520,17 @@ void main(){
 
 	   //make one mask out of the foreground elements 
 	   if (!foregroundelems.empty()){
+		   Mat Mask;
 			for (int j=0;foregroundelems.size()>j;j++){
-				Mat Mask= foregroundelems[j].getMask();
+				Mask= foregroundelems[j].getMask();
 				Mask = (Mask == 1) | (Mask == 3); //make mask binary
-	            morphologyEx(Mask, Mask, CV_MOP_OPEN, element3);   
-				foregroundelems[j].setMask(Mask);
-				if(j!=0){
-					foregroundMask=foregroundMask | foregroundelems[j-1].getMask();
+	            morphologyEx(Mask, Mask, CV_MOP_OPEN, element3);
+				if (j==0){
+					foregroundMask=Mask;
+				}else{
+				foregroundMask=foregroundMask | Mask;
 				}
 			}
-			foregroundMask=foregroundMask | foregroundelems[foregroundelems.size()].getMask();
 	   }else{
 			foregroundMask.setTo(0);
 	   }
@@ -405,7 +554,7 @@ void main(){
 	   if(delta_ticks > 0)
        fps = CLOCKS_PER_SEC / delta_ticks;
 	   fpsarray.push_back(fps);
-	   cout << fps << endl;
+	   //cout << fps << endl;
 	}
 	
 double sum = accumulate(fpsarray.begin(), fpsarray.end(), 0.0);
