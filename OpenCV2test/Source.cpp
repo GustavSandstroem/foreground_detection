@@ -57,9 +57,9 @@ void setMOG2(Ptr<BackgroundSubtractorMOG2> object){
 	object->set("fCT", 0.05); //complexity reduction param, determines if more guassians should be maintained
 
 	//even more params...
-	object->set("fVarInit",15.0); //variance in image, determines speed of adaptation
+	object->set("fVarInit", 15.0); //variance in image, determines speed of adaptation
 	object->set("fVarMin",0.0);
-	object->set("fVarMax",30.0);
+	object->set("fVarMax",25.0);
 }
 
 /*!
@@ -80,6 +80,9 @@ bool hasNonZero(Mat binary_input){
  * \parm input padding adds extra padding. 
  */
 vector<Rect> getROIs(Mat binary_input, Mat same_scale_image, int paddingx, int paddingy){
+	if (binary_input.channels()==3){
+		cv::cvtColor(binary_input, binary_input, CV_BGR2GRAY);
+	}
 	Mat ContourImg = binary_input.clone();  
 	vector< vector< Point> > contours;  
 	findContours(ContourImg, contours,  CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
@@ -94,12 +97,12 @@ vector<Rect> getROIs(Mat binary_input, Mat same_scale_image, int paddingx, int p
 			++itc;
 	}  
 	//get rid of overlaping rectangels. 
-	groupRectangles(rects, 1, 1);
+	groupRectangles(rects, 1, 0.01);
 
-	//sort by area
-	sort(rects.begin(), rects.end(), [](Rect a, Rect b){
-			return b.area()< a.area();
-	});
+	////sort by area
+	//sort(rects.begin(), rects.end(), [](Rect a, Rect b){
+	//		return b.area()< a.area();
+	//});
 	return rects;
 }
 
@@ -124,12 +127,18 @@ vector<Rect> simpleDistanceEstiamte(vector<Rect> input, Mat frame){
 
 vector<Rect> realDistanceEstimate(vector<Rect> input, Mat frame, int horizion, int player, int focal_length){
 	vector<Rect> elligable;
-	double assumed_height= 1.8;
-	double assumed_minheight=1;
+	vector<Rect> remove;
+
+	double assumed_height= 1.7;
+	double assumed_minheight=1.7;
+	double to_pixels=1080/5.6;
+
 	//what is the depth of tee?
-	int z_tee=focal_length*assumed_height/player;
+	int z_tee=focal_length*assumed_height*to_pixels/player;
+
 	//what is infered playerheight 2 meters behind tee?
-	int player_min=focal_length*assumed_minheight/z_tee;
+	int player_min=focal_length*to_pixels*assumed_minheight/(z_tee+2);
+
 
 	vector<Rect>::iterator itc= input.begin();  
 	   while (itc!=input.end()){  
@@ -137,11 +146,16 @@ vector<Rect> realDistanceEstimate(vector<Rect> input, Mat frame, int horizion, i
 		   if ((*itc).br().y > horizion){
 			   if((*itc).height > player_min){
 				   elligable.push_back((*itc));
+			   }else{
+					remove.push_back((*itc));
 			   }
+		   }else{
+				remove.push_back((*itc));
 		   }
 		   ++itc;
 		}  
-	return elligable;
+	//return elligable;
+	return remove;
 }
 
 /*!
@@ -181,30 +195,30 @@ Mat getGrabCutMask(Mat Mog_mask, Mat Mog_mask_shadow, Rect ROI){
 }
 
 Mat getGrabCutMask2(Mat Mog_mask, Mat Mog_padd, Mat Mog_close, Mat Mog_mask_shadow){
-		    	Mat PB_BG;
-				Mat FG;
-				Mat PB_FG;
-				Mat shadow;
-				Mat fill;
-				Mat returnmask;
+	Mat PB_BG;
+	Mat FG;
+	Mat PB_FG;
+	Mat shadow;
+	Mat fill;
+	Mat returnmask;
 
-				fill=Mog_mask|Mog_close;
-				threshold(Mog_mask, FG, 127, 1, 0);
-				threshold(Mog_padd, PB_BG, 127, 2, 0);
-				threshold(fill, fill, 127, 1, 0);
-				threshold(Mog_mask_shadow, shadow, 127, 1, 0);
+	fill=Mog_mask|Mog_close;
+	threshold(Mog_mask, FG, 127, 1, 0);
+	threshold(Mog_padd, PB_BG, 127, 2, 0);
+	threshold(fill, fill, 127, 1, 0);
+	threshold(Mog_mask_shadow, shadow, 127, 1, 0);
 
-				fill=fill-Mog_mask;
-				fill=fill-shadow;
-				fill.setTo(0, fill == -1); 
+	fill=fill-Mog_mask;
+	fill=fill-shadow;
+	fill.setTo(0, fill == -1); 
 
 
-				returnmask=PB_BG-FG+fill;
+	returnmask=PB_BG-FG+fill;
 
-				//double min, max;
-				//minMaxLoc(returnmask, &min, &max);
-				//cout << "minmax" << min << max;
-				return returnmask;
+	//double min, max;
+	//minMaxLoc(returnmask, &min, &max);
+	//cout << "minmax" << min << max;
+	return returnmask;
 }
 
 /*!
@@ -232,117 +246,6 @@ Point boxTopLeft(Point center, Point heightwidth){
 	return TL;
 }
 
-/*!
- * \perfrom one grabcut with given model, using mask or eval depeding on ratio of existing pixles in foreground
- */
-Mat performGrabCut(bool usemask, Mat image, Mat mask, Mat mask_shadow, Mat bgModel, Mat grabCutMask, Mat fgModel, Rect ROI, Rect ROI_last, int itterataions, int itteration, int grabcut_rate, float recompute_ratio){
-	//compute the ratio
-	double ratio=0; 
-	if (itteration!=0){
-		Rect temp= ROI | ROI_last;
-		ratio= (double) temp.area()/ROI.area();
-	}
-
-	//if use mask evaluate if reinitialize or not. 
-	if (usemask){
-		Mat tempMOG=getGrabCutMask(mask, mask_shadow, ROI);
-		if (grabCutMask.channels()==3){
-		cv::cvtColor(grabCutMask, grabCutMask, CV_BGR2GRAY);
-		}
-
-		tempMOG(ROI).copyTo(grabCutMask(ROI));
-
-		if (itteration%grabcut_rate==0 || ratio<recompute_ratio){
-			grabCut(image, grabCutMask, Rect(), bgModel, fgModel, itterataions, GC_INIT_WITH_MASK);
-			std::cout << "renitialize model" << std::endl;
-		}else{
-			grabCut(image, grabCutMask, Rect(), bgModel, fgModel, itterataions, GC_EVAL);
-		};
-	}else{
-		grabCut(image, grabCutMask, ROI, bgModel, fgModel, itterataions, GC_INIT_WITH_RECT); //if asked to do so by paramter use mask
-	};
-	return grabCutMask;
-}
-
-vector<Rect> HOGdetectors(Mat image){
-	vector<cv::Rect> found;
-	vector<cv::Rect> found2;
-	HOGDescriptor hog;
-	int stride=8;
-	//Typical values for padding include (8, 8), (16, 16), (24, 24), and (32, 32).
-	int padding=16;
-	//Typical values for scale  are normally in the range [1.01, 1.5]. If you intend on running detectMultiScale  in real-time, this value should be as large as possible without significantly sacrificing detection accuracy.
-	double pyr_scale=1.05;
-	bool use_mean_shift=false;
-	//A GPU example applying the HOG descriptor for people detection can be found at opencv_source_code/samples/gpu/hog.cpp
-	//gpu::HOGDescriptor::getDefaultPeopleDetector
-	hog.setSVMDetector(cv::HOGDescriptor::getDefaultPeopleDetector());
-	// 64x128 is default size for people. should not be smaller than that.
-	hog.detectMultiScale(image, found, 0, cv::Size(stride,stride), cv::Size(padding,padding), pyr_scale, use_mean_shift);
-	//hog.detectMultiScaleROI exist
-
-	int loop=found.size();
-	for (int j=0;loop>j;j++){
-			//Rect temp=enlargeROI(image, found[j], 10, 50);
-			//found2.push_back(temp);
-			//found2.push_back(temp);
-			found.push_back(found[j]);
-			//rectangle(boxF, temp, Scalar(0,255,0));
-		}
-
-		groupRectangles(found, 1, 0.20);
-		//sort by top left in x
-		sort(found.begin(), found.end(), [](Rect a, Rect b){
-			return b.tl().x < a.tl().x;
-		});
-
-		return found;
-		//for (int u=0; ROIs.size() >u; u++){
-		//	rectangle(boxF, tempROI[u], Scalar(255,0,0));
-		//}
-		//imshow("hog detectors", boxF);
-}
-
-KalmanFilter initKalman(float x, float y)
-{
-    KalmanFilter KF(4, 2, 0);
-	KF.transitionMatrix = *(Mat_<float>(4, 4) << 1,0,1,0,   0,1,0,1,  0,0,1,0,  0,0,0,1);
-
-	// init...
-	KF.statePre.at<float>(0) = x;
-	KF.statePre.at<float>(1) = y;
-	KF.statePre.at<float>(2) = 0;
-	KF.statePre.at<float>(3) = 0;
-	KF.statePost.at<float>(0) = x;
-	KF.statePost.at<float>(1) = y;
-	KF.statePost.at<float>(2) = 0;
-	KF.statePost.at<float>(3) = 0;
-		
-
-	setIdentity(KF.measurementMatrix);
-	setIdentity(KF.processNoiseCov, Scalar::all(1e-4));
-	setIdentity(KF.measurementNoiseCov, Scalar::all(1e-1));
-	setIdentity(KF.errorCovPost, Scalar::all(.1));
-	return KF;
-
-}
-
-Point kalmanPredict(KalmanFilter KF) 
-{
-    Mat prediction = KF.predict();
-    Point predictPt(prediction.at<float>(0),prediction.at<float>(1));
-    return predictPt;
-}
-
-Point kalmanCorrect(KalmanFilter KF, float x, float y)
-{
-	Mat_<float> measurement(2,1); 
-    measurement(0) = x;
-    measurement(1) = y;
-    Mat estimated = KF.correct(measurement);
-    Point statePt(estimated.at<float>(0),estimated.at<float>(1));
-    return statePt;
-}
 
 Mat drawBoxes(vector<Rect> boxes, Mat image, Scalar colour){
 	vector<Rect>::iterator itc= boxes.begin();  
@@ -354,15 +257,32 @@ Mat drawBoxes(vector<Rect> boxes, Mat image, Scalar colour){
 }
 
 void main(){
-
+	//options
+	bool record_video=false;
+	bool validation=true;
+	bool use_depth=false;
+	bool use_superres=false;
+	bool normalize_light=false;
+	int min=1000;
 	//downsample
 	int downsample_MOG=4;
-	int downsample_GRABCUT=4;
+	//int downsample_GRABCUT=4;
 
 	//assumptionqs for distance estimate
+	//for dataset1 - 152
 	double f= 12;
 	int hor=600/downsample_MOG;
 	int play=1100/downsample_MOG;
+
+	////for dataset2 - 114
+	//double f= 12;
+	//int hor=700/downsample_MOG;
+	//int play=650/downsample_MOG;
+
+	////for dataset4
+	//double f= 12;
+	//int hor=600/downsample_MOG;
+	//int play=400/downsample_MOG;
 
 	////MOG2
 	Mat fgMaskMOG2; //fg-mask generated by MOG2 method  
@@ -371,41 +291,46 @@ void main(){
 
 		//params for initialization
 		bool bShadowDetection=true;
-		int history=1000; //divde by 25 for secounds of training. Standard seems to be 200 frames. 
-		float Cthr=30.0;
+		int history=500; //divde by 25 for secounds of training. Standard seems to be 200 frames. 
+		float Cthr=15.0;
 		float learnrate= -1; //automagic is -1 -> WTF is fckning -0.5 from examples!?
 
 		pMOG2 = new BackgroundSubtractorMOG2(history, Cthr,bShadowDetection);
 		setMOG2(pMOG2);
 
+		Mat fgMaskMOG22; //fg-mask generated by MOG2 method  
+		Mat fgMaskMOG2_shadow2; //shadow-mask generated by MOG2 method 
+		Ptr< BackgroundSubtractor> pMOG22; //MOG2 Background subtractor
+		pMOG22 = new BackgroundSubtractorMOG2(history, Cthr,bShadowDetection);
+		setMOG2(pMOG22);
+		Mat frameCropped;
+		Mat resizeF2;
+
 	//FRAMES FOR PROGRAM
 	Mat frame; //current frame  
 	Mat resizeF; //current frame in MOG resolution
-	Mat reconstructF; //current frame in GRABCUT resolution
 	Mat Output; //the returned mask
 	Mat boxF=frame.clone(); //draw stuff on the current frame
 
 	//INITIALIZE OUTPUT/INPUT
-	VideoCapture stream("Data/Input/GUSTAV0152.MOV"); //%TODO can be made into an argument for fuction 
+	VideoCapture stream("Data/Input/syn_0062.avi"); //%TODO can be made into an argument for fuction 
 	if(!stream.isOpened()){
-		//return -1; //exit
-
+        cout  << "Could not open the input video to read "<< endl;
 	}
 	VideoWriter outputVideo;   // Open the output
-	outputVideo.open("Data/Results/video.avi", -1, 25, Size(480,270), true);
+	outputVideo.open("Data/Results/video.avi", -1, 25, Size(1920,1080), true);
 	if (!outputVideo.isOpened())
-    {
-        cout  << "Could not open the output video for write "<< endl;
-    }
+	{
+		cout  << "Could not open the output video for write "<< endl;
+	}
+	
 
 	//Grabcut
-	PFS foregroundclass;
-	vector<PFS> foregroundelems;
 	Mat fgModel;
 	Mat bgModel;
 
 		//params
-		int grabcut_itter= 2;
+		int grabcut_itter= 1;
 		int grabcut_rate=50; //div by 25 for rate
 		float recompute_ratio=0.5;
 
@@ -435,13 +360,35 @@ void main(){
 			break;     
 		}  
 
-		//shift pixles
-		//Mat frameCropped;
-		//frameCropped = frame(Rect(2,2,frame.size().width-2, frame.size().height-2)).clone();
+ 
 
 	   //downsample
-	   resize(frame, resizeF, Size(frame.size().width/downsample_MOG, frame.size().height/downsample_MOG), INTER_AREA);  //%TODO is this right or should i create one myself
-	   resize(frame, reconstructF,  Size(frame.size().width/downsample_GRABCUT, frame.size().height/downsample_GRABCUT), INTER_AREA);
+	   resize(frame, resizeF, Size(frame.size().width/downsample_MOG, frame.size().height/downsample_MOG), INTER_NEAREST); 
+
+	   imshow("original", resizeF);
+
+	   //normalize_light
+	   if(normalize_light){
+			cv::cvtColor(resizeF, resizeF, CV_BGR2Lab);
+
+			// Extract the L channel
+			std::vector<cv::Mat> lab_planes(3);
+			cv::split(resizeF, lab_planes);  // now we have the L image in lab_planes[0]
+
+			// apply the CLAHE algorithm to the L channel
+			cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
+			clahe->setClipLimit(4);
+			cv::Mat dst;
+			clahe->apply(lab_planes[0], dst);
+
+			// Merge the the color planes back into an Lab image
+			dst.copyTo(lab_planes[0]);
+			cv::merge(lab_planes, resizeF);
+
+		   // convert back to RGB
+		   cv::cvtColor(resizeF, resizeF, CV_Lab2BGR);
+		   imshow("normalize colour", resizeF);
+	   }
 
 	   ////apply BS
 	   pMOG2->operator()(resizeF, fgMaskMOG2, learnrate);  
@@ -452,161 +399,155 @@ void main(){
 	   fgMaskMOG2_shadow=Mask.second;
 	   Mat pMog;
 	   Mat p2Mog;
+
+	   	if(use_superres){
+			//1918x1078
+			frameCropped = frame(Rect(downsample_MOG/2,downsample_MOG/2,frame.size().width-downsample_MOG/2, frame.size().height-downsample_MOG/2)).clone();
+			//478x268
+			resize(frameCropped, resizeF2, Size(frame.size().width/downsample_MOG-downsample_MOG/2, frame.size().height/downsample_MOG-downsample_MOG/2), INTER_AREA);  
+			pMOG22->operator()(resizeF2, fgMaskMOG2, learnrate);  
+			pair<Mat, Mat> Mask=separateMaskMOG2(fgMaskMOG2);
+			fgMaskMOG22= Mask.first;
+			fgMaskMOG2_shadow2=Mask.second;
+
+			//958x538
+			resize(fgMaskMOG22, fgMaskMOG22, Size(frame.size().width*2/downsample_MOG-downsample_MOG/2, frame.size().height*2/downsample_MOG-downsample_MOG/2), INTER_AREA); 
+			resize(fgMaskMOG2_shadow2, fgMaskMOG2_shadow2, Size(frame.size().width*2/downsample_MOG-downsample_MOG/2, frame.size().height*2/downsample_MOG-downsample_MOG/2), INTER_AREA); 
+
+			//960x540
+			resize(fgMaskMOG2, fgMaskMOG2, Size(frame.size().width*2/downsample_MOG, frame.size().height*2/downsample_MOG), INTER_AREA); 
+			resize(fgMaskMOG2_shadow, fgMaskMOG2_shadow, Size(frame.size().width*2/downsample_MOG, frame.size().height*2/downsample_MOG), INTER_AREA); 
+			Mat full=fgMaskMOG2.clone();
+			full.setTo(0);
+			Mat fulls=fgMaskMOG2_shadow.clone();
+			fulls.setTo(0);
+			
+			//958x538
+			Rect print =Rect(downsample_MOG/2,downsample_MOG/2,frame.size().width/2-downsample_MOG/2, frame.size().height/2-downsample_MOG/2);
+			
+			//960x540
+			fgMaskMOG22.copyTo(full(print));
+			fgMaskMOG2_shadow2.copyTo(fulls(print));
+			bitwise_or(fgMaskMOG2, full, fgMaskMOG2);
+			bitwise_or(fgMaskMOG2_shadow, fulls, fgMaskMOG2_shadow);
+
+			//478x268
+			resize(fgMaskMOG2, fgMaskMOG2, Size(frame.size().width/downsample_MOG, frame.size().height/downsample_MOG), INTER_AREA);  
+			resize(fgMaskMOG2_shadow, fgMaskMOG2_shadow, Size(frame.size().width/downsample_MOG, frame.size().height/downsample_MOG), INTER_AREA); 
+		}
+
 	   //apply postprocessing
 	   morphologyEx(fgMaskMOG2, fgMaskMOG2, CV_MOP_OPEN, element);   
 	   morphologyEx(fgMaskMOG2, pMog, CV_MOP_DILATE, element4);   
 	   morphologyEx(fgMaskMOG2, p2Mog, CV_MOP_CLOSE, element2);   
-
-
-	   //morphologyEx(fgMaskMOG2, fgMaskMOG2, CV_MOP_CLOSE, element);   
 	   morphologyEx(fgMaskMOG2_shadow, fgMaskMOG2_shadow, CV_MOP_OPEN, element3);   
 
-	   //get ROI
-	   boxF=resizeF.clone();
-	   vector<Rect> ROIs= getROIs(fgMaskMOG2, resizeF, 10, 20); //used to be 5 10
-	   boxF=drawBoxes(ROIs, boxF, Scalar(255,0,0));
-	   //please note that these paramters are approximate
-	   ROIs=realDistanceEstimate(ROIs, resizeF, hor, play, f);
-	   boxF=drawBoxes(ROIs, boxF, Scalar(0,0,255));
-	   imshow("blue is removed by distance approx", boxF);
 
 
-	   	Mat foregroundMask(reconstructF.size(), CV_8UC3, cv::Scalar(0)); //how to rescale this with image?
-		//Mat foreground(reconstructF.size(), CV_8UC3, cv::Scalar(255,255,255));
+	   	Mat foregroundMask(resizeF.size(), CV_8UC3, cv::Scalar(0)); //how to rescale this with image?
+		//Mat foreground(resizeF.size(), CV_8UC3, cv::Scalar(255,255,255));
 
-		////sort foreground elements from left to right
-		//sort(foregroundelems.begin(), foregroundelems.end(), [](PFS a, PFS b){
-		//	return b.getROI().tl().x < a.getROI().tl().x;
-		//});
-
-		if (!ROIs.empty()){
+		int c=countNonZero(fgMaskMOG2);
+		if(c>800){
 			Mat use_mask;
 			use_mask=getGrabCutMask2(fgMaskMOG2, pMog, p2Mog, fgMaskMOG2_shadow);
-			imshow("input to GRABCUT",use_mask*255/3);
+			//imshow("input to GRABCUT",use_mask*255/3);
+			if (c<min){
+				min=c;
+			}
 			grabCut(resizeF, use_mask, Rect(), bgModel, fgModel, 2, GC_INIT_WITH_MASK);
 			use_mask = (use_mask == 1) | (use_mask == 3); //make mask binary
-
 			foregroundMask=use_mask.clone();
 		}
-		//Mat use_mask;
-		//Mat temp_mask;
-		//Mat temp_GM;
-		//Mat temp_black;
+		
+			//post-process for GRABCUT NOISE
+			morphologyEx(foregroundMask, foregroundMask, CV_MOP_OPEN, element3);   
 
-		//if (!ROIs.empty()){
-		//   for (int i=0;ROIs.size()>i; i++){
-		//	   
+			//post-process for DEPTH???? 
+		boxF=resizeF.clone();
+		if(use_depth){
+		   //Remove elements by depth-estimate. 
+		   vector<Rect> ROI_normal= getROIs(foregroundMask, resizeF, 0, 0); //used to be 5 10
+		   vector<Rect> remove=ROI_normal;
+		   vector<Rect> remove2;
+		   vector<Rect> ROI_padd= getROIs(foregroundMask, resizeF, 10, 30); //used to be 5 10
 
+		   ROI_normal=realDistanceEstimate(ROI_normal, foregroundMask, hor, play, f);
 
+		   ROI_padd=realDistanceEstimate(ROI_padd, foregroundMask, hor, play, f);
 
-		//	   imshow("mask",temp_GM*255/3);
+		   for (int i=0;i<ROI_padd.size();i++){
+				ROI_normal.push_back(ROI_padd[i]);
+		   }
 
-		//	   if (i==0){
-		//			temp_mask=temp_GM;
-		//		}else{
-		//			temp_black=temp_GM.clone();
-		//			temp_black.setTo(0);
+		   groupRectangles(ROI_normal,1,0.9);
+		   for (int i=0; i<remove.size(); i++){
+			   for (int j=0; j<ROI_normal.size(); j++){
+				   if((remove[i] & ROI_normal[j]).area() > 0){
+						remove2.push_back(remove[i]);
+				   }
+			   }
+		   }
 
-		//			temp_GM(ROIs[i]).copyTo(temp_black(ROIs[i]));
+		   for (int i=0; i<remove2.size(); i++){
+				foregroundMask(remove2[i]).setTo(0);
+		   }
 
+		   boxF=drawBoxes(remove2, boxF, Scalar(0,0,255));
+		}
 
-		//			temp_mask=4*temp_mask + temp_black;
+	   imshow("remove this", boxF);
+	   imshow("graphcutresult", foregroundMask);
 
-		//			//ensures between 0 and 3
-		//			temp_mask.setTo(3, temp_mask > 10); 
-		//			temp_mask.setTo(2, temp_mask == 10); 
-		//			temp_mask.setTo(1, temp_mask == 9); 
-		//			temp_mask.setTo(2, temp_mask == 8); 
-		//			temp_mask.setTo(3, temp_mask == 7); 
-		//			temp_mask.setTo(1, temp_mask > 3); 
-		//		}
-		//   }  	
-		//	if (temp_mask.channels()==3){
-		//		cv::cvtColor(temp_mask, temp_mask, CV_BGR2GRAY);
-		//	}
-		//	temp_mask.copyTo(use_mask);
-		//	grabCut(resizeF, use_mask, Rect(), bgModel, fgModel, 2, GC_INIT_WITH_MASK);
-		//	use_mask = (use_mask == 1) | (use_mask == 3); //make mask binary
-		//	foregroundMask=use_mask.clone();
-		//}else{
-		//	foregroundMask.setTo(0);
-
-		//}
-
-		//if (!ROIs.empty()){
-		//   for (int i=0;ROIs.size()>i; i++){
-		//	   //if detected ROI but no models avalible, add a new one
-		//	   if (foregroundelems.size()<(i+1)){
-		//			PFS foregroundclass;
-		//			foregroundelems.push_back(foregroundclass);
-		//	   }
-		//	   //grabcut on the model matching with the current mask in order left to right
-		//	   Mat bgModel= foregroundelems[i].getBg();
-		//	   Mat fgModel= foregroundelems[i].getFg();
-		//	   Mat temp= Mat(reconstructF.size(), CV_8UC3, cv::Scalar(0));
-		//	   foregroundelems[i].setMask(temp);
-		//	   Mat grabCutMask= foregroundelems[i].getMask();
-		//	   Rect ROI_last=foregroundelems[i].getlast_ROI();
-		//	   grabCutMask=performGrabCut(true, reconstructF, fgMaskMOG2, fgMaskMOG2_shadow, bgModel, grabCutMask, fgModel, ROIs[i], ROI_last, grabcut_itter, fps_itter, grabcut_rate, recompute_ratio);
-		//	   foregroundelems[i].update(fgModel, bgModel, grabCutMask, ROIs[i], ROIs[i]);
-		//	}
-		//};
-
-	 //  //make one mask out of the foreground elements 
-	 //  if (!foregroundelems.empty()){
-		//   Mat Mask;
-		//	for (int j=0;foregroundelems.size()>j;j++){
-		//		Mask= foregroundelems[j].getMask();
-		//		Mask = (Mask == 1) | (Mask == 3); //make mask binary
-	 //           morphologyEx(Mask, Mask, CV_MOP_OPEN, element3);
-		//		if (j==0){
-		//			foregroundMask=Mask;
-		//		}else{
-		//		foregroundMask=foregroundMask | Mask;
-		//		}
-		//	}
-	 //  }else{
-		//	foregroundMask.setTo(0);
-	 //  }
-
-	   fps_itter++;
-
-	   //show stuff
-	   //imshow("Origin", reconstructF);  
-	   //imshow("MOG2", fgMaskMOG2);  
-	   imshow("grabCut (serveral elements)", foregroundMask);  
+	   //scale back to full HD
 	   resize(foregroundMask, Output, Size(frame.size().width, frame.size().height), CV_INTER_LINEAR);
-	   //reconstructF.copyTo(foreground, foregroundMask); //bg pixels are not copied
-	   //imshow("foreground", foreground);
-	   if ((fps_itter%random)==0){
-	   //random= rand()%100+1;
-			imwrite( "Data/Results/MOG2+GrabCut" + to_string(fps_itter) + "foregroundMask.jpg", foregroundMask);
-			//imwrite( "Data/Results/MOG2+GrabCut" + to_string(fps_itter) + "foregroundMaskPROCESSED.jpg", fgMaskMOG2);
-			imwrite( "Data/Results/MOG2+GrabCut" + to_string(fps_itter) + "image.jpg", resizeF);
-			
+	   if (validation){
+		resize(fgMaskMOG2, fgMaskMOG2, Size(frame.size().width, frame.size().height), CV_INTER_LINEAR);
 	   }
-	   outputVideo << foregroundMask;
-	   //imshow("shadow", fgMaskMOG2_shadow);
+	   //show stuff
+	   //imshow("grabCut - LOW RES", foregroundMask);  
+	   //frame.copyTo(foreground, Output); //bg pixels are not copied
+	   //imshow("foreground - FULL RES", foreground);
 
+	   //write to file every 100 frame
+	   if (((fps_itter%random)==0 && validation)){
+			imwrite( "Data/Results/" + to_string(fps_itter) + ".jpg", Output);
+			imwrite( "Data/Results/" + to_string(fps_itter) + "i.jpg", fgMaskMOG2);
+			imwrite( "Data/Results/MOG2+GrabCut" + to_string(fps_itter) + "image.jpg", frame);
+
+	   }
+
+	   if(record_video){
+		   //write to video, every frame
+		   outputVideo << Output;
+	   }
+
+	   //useful for the statistics
+	   fps_itter++;
 	   delta_ticks = clock() - current_ticks; //the time, in ms, that took to render the scene
 	   if(delta_ticks > 0)
        fps = CLOCKS_PER_SEC / delta_ticks;
 	   fpsarray.push_back(fps);
-	   cout << fps << endl;
+	   //cout << fps << endl;
 	}
+
+	imwrite( "Data/Results/" + to_string(fps_itter) + ".jpg", Output);
+	imwrite( "Data/Results/" + to_string(fps_itter) + "i.jpg", fgMaskMOG2);
+
 	
-double sum = accumulate(fpsarray.begin(), fpsarray.end(), 0.0);
-double mean = sum / fpsarray.size();
+	//write and compute statistics
+	double sum = accumulate(fpsarray.begin(), fpsarray.end(), 0.0);
+	double mean = sum / fpsarray.size();
 
-std::vector<double> diff(fpsarray.size());
-std::transform(fpsarray.begin(), fpsarray.end(), diff.begin(), [mean](double x) { return x - mean; });
+	std::vector<double> diff(fpsarray.size());
+	std::transform(fpsarray.begin(), fpsarray.end(), diff.begin(), [mean](double x) { return x - mean; });
 
-double mm=inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
-ofstream myfile;
-myfile.open ("Data/Results/MOG2+GrabCut_results.txt");
-myfile << "fps: ";
-myfile << mean;
-myfile << " +/- ";
-myfile << sqrt(mm / fpsarray.size());
-myfile.close();
+	double mm=inner_product(diff.begin(), diff.end(), diff.begin(), 0.0);
+	ofstream myfile;
+	myfile.open ("Data/Results/MOG2+GrabCut_results.txt");
+	myfile << "fps: ";
+	myfile << mean;
+	myfile << " +/- ";
+	myfile << sqrt(mm / fpsarray.size());
+	myfile.close();
 }  
