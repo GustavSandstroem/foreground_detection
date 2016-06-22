@@ -166,7 +166,6 @@ void mergeOverlappingBoxes(std::vector<cv::Rect> &inputBoxes, cv::Mat &image, st
 	}
 }
 
-
 Mat fadeIn(Mat img1, Mat img2, int len){
 Mat dst;
 	for (int i = 0; i < len; i++){
@@ -188,29 +187,78 @@ void AlphaBlend(const Mat& imgFore, Mat& imgDst, const Mat& alpha)
 	blend.copyTo(imgDst);
 }
 
+void setMOG(gpu::MOG2_GPU & pMOG2_g){
+	pMOG2_g.history = 500;
+	pMOG2_g.varThreshold = 15;
+	pMOG2_g.bShadowDetection = true;
+	pMOG2_g.backgroundRatio = 0.5; // 0.9 //0.7 
+	pMOG2_g.varThreshold = 3;
+	pMOG2_g.varThresholdGen = 9.0;
+	pMOG2_g.fTau = 0.7;
+	pMOG2_g.fCT = 0.05;
+	pMOG2_g.fVarInit = 15.0;
+	pMOG2_g.fVarMin = 0.0;
+	pMOG2_g.fVarMax = 15.0;
+}
+
+Mat getGrabCutMask2(Mat Mog_mask, Mat Mog_padd, Mat Mog_close, Mat Mog_mask_shadow){
+	Mat PB_BG;
+	Mat FG;
+	Mat PB_FG;
+	Mat shadow;
+	Mat fill;
+	Mat returnmask;
+
+	fill = Mog_mask | Mog_close;
+	threshold(Mog_mask, FG, 127, 1, 0);
+	threshold(Mog_padd, PB_BG, 127, 2, 0);
+	threshold(fill, fill, 127, 1, 0);
+	threshold(Mog_mask_shadow, shadow, 127, 1, 0);
+
+	fill = fill - Mog_mask;
+	fill = fill - shadow;
+	fill.setTo(0, fill == -1);
+
+	returnmask = PB_BG - FG + fill;
+
+
+
+	//double min, max;
+	//minMaxLoc(returnmask, &min, &max);
+	//cout << "min max" << min << " " << max << endl;
+	return returnmask;
+}
 
 int main(){	
 	////////////////////////////////////////////////////////////////////////
 	//functionallity. BOOL. 1 is use. 0 is disable
-	bool rescale_gpu = 0;
-	bool use_blur = 0;
-	bool use_watershead = 1;
+	bool use_pyrDown = 0;
+	bool use_watershead = 0;
+	bool use_grabcut = 0;
 	bool watershead_native_size = 0;
-	bool record = 1;
-	bool printout_status = 1;
-	bool show_origin = 0;
-	bool show_result = 1;
-	bool save_result = 1;
-	bool show_markers = 1;
-	bool save_bg = 0;
-	bool save_fg = 0;
-	bool save_lowres = 1; //TODO might be a problem with framedrop.
 	bool remove_shadow = 1;
 	bool post_open = 1;
-	bool tv_average_smooth = 1;
-	bool demo = 1;
 	bool use_depth = 1;
-	//bool normalize_light = 0;
+	bool use_superres = 0;
+	bool use_robust = 0;
+	bool lightplot = 0;
+	bool normalize_light = 0;
+	bool remove_grass = 0;
+	bool record = 0;
+	bool printout_status = 1;
+	bool show_origin = 1;
+	bool show_result = 0;
+	bool show_markers = 0;
+
+	bool save_result = 0;
+	bool save_bg = 0;
+	bool save_fg = 0;
+	bool tv_average_smooth = 0;
+	bool demo = 0;
+	bool not_golf = 0;
+	bool show_downscaled = 1;
+
+
 
 	//152
 	double f = 25;
@@ -218,43 +266,31 @@ int main(){
 	int play = 1100 / 4;
 	int balldist = 3;
 	int camera_height = 1;
+	int ball_h = 900;
 
 	//video 142
-	hor = 180;
-	play = 600/4;
+	//hor = 180 ;
+	//play = 600/4;
 
 	//video 0002
-	hor = 150;
-	play = 170;
+	//hor = 150*4;
+	//play = 170*4;
+
+	//demo
+	hor = 590;
+	play = 500;
+
 
 
 	//DISTANCE ESTIMATED
-	//get rotation
 	double assumed_height = 1.7;
 	double to_pixels = 1080 / 5.6;
 	double focal_length = (play*balldist) / assumed_height;
-	cout << "assumed focal-length [mm]" << focal_length*to_pixels << endl;
-	int diff = (RWIDTH / 2 - hor);
-	double alpha = std::atan(diff/focal_length);
-
-	//make matrix
-	Mat transformation = Mat::zeros(3, 4, CV_8UC1);
-	//rot
-	transformation.at<double>(1,1) = 1;
-	transformation.at<double>(2,2)= std::cos(alpha);
-	transformation.at<double>(2,3)=-std::sin(alpha);
-	transformation.at<double>(3,2)= std::sin(alpha);
-	transformation.at<double>(3,3)= std::cos(alpha);
-	//translate
-	transformation.at<double>(3,4) = -camera_height;
 
 	//thres
 	double assumed_minheight = 1;
-
-	//what is infered playerheight 2 meters behind tee?
-	int player_min = focal_length*assumed_minheight / (balldist + 2);
-	cout << "thres " << player_min << endl;
-	int thres = 100;
+	int player_min = focal_length*assumed_minheight / (balldist);
+	int thres = focal_length*assumed_minheight / (balldist + 2);
 
 	/////////////////////////////////////////////////////////////////////////
 	//verify that CUDA works. 
@@ -273,42 +309,49 @@ int main(){
 		return -1;
 	}
 
+	Mat trace = cv::imread("Data/trace.png", CV_LOAD_IMAGE_GRAYSCALE);
+	threshold(trace, trace, 254, 255, THRESH_BINARY_INV);
+	trace.convertTo(trace, CV_8U);
+	//imshow("trace", trace);
+
 	/////////////////////////////////////////////////////////////////////////
 	//MOG2
 	gpu::MOG2_GPU pMOG2_g(3);
-	pMOG2_g.history = 1000; 
-	pMOG2_g.varThreshold = 15; 
-	pMOG2_g.bShadowDetection = true;
-	pMOG2_g.backgroundRatio = 0.4; // 0.9 //0.7 
-	pMOG2_g.varThreshold = 3;
-	pMOG2_g.varThresholdGen = 9.0;
-	pMOG2_g.fTau = 0.5;
-	pMOG2_g.fCT = 0.05;
-	pMOG2_g.fVarInit = 15.0;
-	pMOG2_g.fVarMin = 0.0;
-	pMOG2_g.fVarMax = 15.0;
+	setMOG(pMOG2_g);
 
 	gpu::GpuMat Mog_Mask_g;
 	Mat Mog_Mask;
+	Mat Mog_Mask_padded;
+	Mat Mog_Mask_extrapadded;
+
+
 	Mat Mog_Mask_shadow;
+
+
+	gpu::MOG2_GPU pMOG2_g2(3);
+	setMOG(pMOG2_g2);
+	gpu::GpuMat Mog_Mask_g2;
+	Rect print = Rect(2, 2, 958, 538);
+	gpu::GpuMat full;
+	gpu::GpuMat fulls;
+
 
 	/////////////////////////////////////////////////////////////////////////  
 	//Intialize videocapture and read imput!
 	//device – id of the opened video capturing device (i.e. a camera index). If there is a single camera connected, just pass 0.
-
-	VideoCapture cap("Data/syn_0002.avi");
+	VideoCapture cap("Data/output.mov");
 	if (!cap.isOpened()){
-		cout << "video not opened" << endl;
-		return -1;
+		cout << "INPUT video not opened" << endl;
+		return -1;	
 	}
+
 	VideoWriter outputVideo;   // Open the output. set 2nd arguemnt to -1 for popup select of codec. 
 	//outputVideo.open("video.avi", -1, 25, Size(OWIDTH, OHEIGHT), true);
-	Size sizen = Size(RWIDTH, RHEIGHT);
-	if (!save_lowres){
-		sizen = Size(OWIDTH, OHEIGHT);
-	}
+	Size sizen = Size(OWIDTH, OHEIGHT);
+	
 	//outputVideo.open("video.avi", CV_FOURCC('I', 'Y', 'U', 'V'), 25, sizen, true);
-	outputVideo.open("Data/Results/video.avi", CV_FOURCC('I', 'Y', 'U', 'V'), 25, sizen, true);
+	//outputVideo.open("Data/new/video.avi", CV_FOURCC('I', 'Y', 'U', 'V'), 25, sizen, true);
+	outputVideo.open("Data/resultatfilm.avi", -1, 29, sizen, true);
 
 	if (!outputVideo.isOpened())
 	{
@@ -319,23 +362,32 @@ int main(){
 	/////////////////////////////////////////////////////////////////////////
 	Mat o_frame;
 	Mat r_frame;
+	Mat o_frame_cropped;
+	Mat r_frame_cropped;
+
 	Mat result = Mat::zeros(RHEIGHT, RWIDTH, CV_8UC1);
 	Mat markers;
 	Mat first = Mat::zeros(RHEIGHT, RWIDTH, CV_8UC1);
 	Mat secound = Mat::zeros(RHEIGHT, RWIDTH, CV_8UC1);
 	Mat third = Mat::zeros(RHEIGHT, RWIDTH, CV_8UC1);
 
-	gpu::GpuMat o_frame_gpu;
+	//gpu::GpuMat o_frame_gpu;
 	gpu::GpuMat r_frame_gpu;
-	gpu::GpuMat rg_frame_gpu;
-	gpu::GpuMat r_frame_blur_gpu;
+
+	//gpu::GpuMat o_frame_gpu_cropped;
+	gpu::GpuMat r_frame_gpu_cropped;
+
+	//Grabcut
+	Mat fgModel;
+	Mat bgModel;
+	
+	ofstream myfile;
+	myfile.open("example.txt");
 
 	/////////////////////////////////////////////////////////////////////////  
 	cap >> o_frame;
 	if (o_frame.empty())
 		return 0;
-	vector< gpu::GpuMat> gpurgb(3);
-	vector< gpu::GpuMat> gpurgb2(3);
 
 	/////////////////////////////////////////////////////////////////////////  
 	unsigned long AAtime = 0, BBtime = 0;
@@ -350,108 +402,151 @@ int main(){
 		if (o_frame.empty())
 			return 0;
 
-		//Resize. 
-		//on 4096×3072.jpg, 2,3 MB by 4x downscale excluded upload time CPU in average ~6.5 ms, the GPU ~1.65 ms. 
-		//use rescale_gpu==0 if you want to decrease CPU load as a tradeoff for PCI-E bandwidth to GPU. 
+
+		//Resize. It quicker to downsample on GPU and transfer small version to GPU than to vice versa.
 		//INTER_AREA will merge many pixles to one. WITh RWIDTH and RHEIGHT => 4x downscale. Prefeable for MOG2 
 		//according to reserach by Gustav Sandström Exjobb Protracer 2016. 
-		if (rescale_gpu){
-			o_frame_gpu.upload(o_frame);
-			gpu::resize(o_frame_gpu, r_frame_gpu, Size(RWIDTH, RHEIGHT), INTER_AREA);
-			r_frame_gpu.download(r_frame);
-		}
-		else{
-			resize(o_frame, r_frame, Size(RWIDTH, RHEIGHT), INTER_AREA);
-			r_frame_gpu.upload(r_frame);
+		if (use_pyrDown){
+		pyrDown(o_frame, r_frame, Size(o_frame.cols / 2, o_frame.rows / 2));
+		pyrDown(r_frame, r_frame, Size(r_frame.cols / 2, r_frame.rows / 2));
+		}else{
+			resize(o_frame, r_frame, Size(RWIDTH, RHEIGHT), INTER_NEAREST);
 		}
 
-		////normalize_light ON GPU
-		//if (normalize_light){
-		//	gpu::cvtColor(r_frame_gpu, r_frame_gpu, CV_BGR2Lab);
-		//	// Extract the L channel
-		//	std::vector<cv::gpu::GpuMat> lab_planes(3);
+		if (normalize_light){
+			cv::cvtColor(r_frame, r_frame, CV_BGR2Lab);
 
-		//	cv::gpu::split(r_frame_gpu, lab_planes);  // now we have the L image in lab_planes[0]
+			// Extract the L channel
+			std::vector<cv::Mat> lab_planes(3);
+			cv::split(r_frame, lab_planes);  // now we have the L image in lab_planes[0]
 
-		//	// apply the CLAHE algorithm to the L channel
-		//	cv::Ptr<cv::gpu::CLAHE> clahe = cv::gpu::createCLAHE();
+			// apply the CLAHE algorithm to the L channel
+			cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
+			clahe->setClipLimit(4);
+			cv::Mat dst;
+			clahe->apply(lab_planes[0], dst);
 
-		//	clahe->setClipLimit(4);
+			// Merge the the color planes back into an Lab image
+			dst.copyTo(lab_planes[0]);
+			cv::merge(lab_planes, r_frame);
 
-		//	cv::gpu::GpuMat dst;
-
-		//	clahe->apply(lab_planes[0], dst);
-
-		//	// Merge the the color planes back into an Lab image
-		//	dst.copyTo(lab_planes[0]);
-
-		//	cv::gpu::merge(lab_planes, r_frame_gpu);
-
-		//	// convert back to RGB
-		//	cv::gpu::cvtColor(r_frame_gpu, r_frame_gpu, CV_Lab2BGR);
-		//	r_frame_gpu.download(r_frame);
-		//	imshow("normalize colour", r_frame);
-		//}
-
-		//Preprocess with Gaussian blur per colour channel. ON GPU. 
-		if (use_blur){
-			gpu::split(r_frame_gpu, gpurgb);
-			gpu::blur(gpurgb[0], gpurgb2[0], Size(3, 3));
-			gpu::blur(gpurgb[1], gpurgb2[1], Size(3, 3));
-			gpu::blur(gpurgb[2], gpurgb2[2], Size(3, 3));
-			gpu::merge(gpurgb2, r_frame_gpu);
+			// convert back to RGB
+			cv::cvtColor(r_frame, r_frame, CV_Lab2BGR);
+			imshow("normalize colour", r_frame);
 		}
+
+		r_frame_gpu.upload(r_frame);
+
+		if (use_superres){
+			o_frame_cropped = o_frame(Rect(2, 2, 1918, 1078)).clone();
+			resize(o_frame_cropped, r_frame_cropped, Size(478, 268), INTER_NEAREST);
+			r_frame_gpu_cropped.upload(r_frame_cropped);
+		}
+		int meanet;
+		cv::Scalar menet;
+		if (lightplot){
+			Mat r_frame_hsv;
+			cvtColor(r_frame, r_frame_hsv, COLOR_BGR2HSV);
+			menet=mean(r_frame_hsv);
+			//meanet = menet.val[0];
+			//myfile << to_string(meanet);
+			//myfile << "\n";
+
+			//meanet = menet.val[1];
+			//myfile << to_string(meanet);
+			//myfile << "\n";
+
+			meanet = menet.val[2];
+			myfile << to_string(meanet);
+			myfile << "\n";
+
+			//meanet = menet.val[3];
+			//myfile << to_string(meanet);
+			//myfile << "\n";
+		}
+
+
+
 
 		//use MOG2 and separate shadows and foreground. Shadows are tracked by MOG2 with fTau as threshold. Adjust if too much or too little is detected. 
 		pMOG2_g.operator()(r_frame_gpu, Mog_Mask_g, -1);
 		pair<gpu::GpuMat, gpu::GpuMat> Mask = separateMaskMOG2_gpu(Mog_Mask_g);
 
+		//use superresolution. MOG is run twice, with differnt downsamples. result is either joined with bitwise_and or bit_wise_or depending on "robustness_mode". And is robust. 
+		if (use_superres){
+				//run the secound instance of MOG
+				pMOG2_g2.operator()(r_frame_gpu_cropped, Mog_Mask_g2, -1);
+				pair<gpu::GpuMat, gpu::GpuMat> Mask2 = separateMaskMOG2_gpu(Mog_Mask_g2);
+
+				//958x538
+				gpu::GpuMat tempen;
+				gpu::GpuMat tempen2;
+				gpu::resize(Mask2.first, tempen, Size(958, 538), INTER_NEAREST);
+				gpu::resize(Mask2.second, tempen2, Size(958, 538), INTER_NEAREST);
+
+				//960x540
+				gpu::GpuMat tempen3;
+				gpu::GpuMat tempen4;
+				gpu::resize(Mask.first, tempen3, Size(960, 540), INTER_NEAREST);
+				gpu::resize(Mask.second, tempen4, Size(960, 540), INTER_NEAREST);
+
+				full = (tempen3).clone();
+				full.setTo(0);
+				fulls = (tempen4).clone();
+				fulls.setTo(0);
+
+				//960x540
+				(tempen).copyTo(full(print));
+				(tempen2).copyTo(fulls(print));
+				
+				gpu::GpuMat temp5;
+				gpu::GpuMat temp6;
+				if (use_robust){
+					bitwise_and(tempen4, fulls, temp6);
+					bitwise_and(tempen3, full, temp5);
+
+				} 
+				else{
+					bitwise_or(tempen3, full, temp5);
+					bitwise_or(tempen4, fulls, temp6);
+				}
+				//480x270
+				resize(temp5, Mask.first, Size(480, 270), INTER_NEAREST);
+				resize(temp6, Mask.second, Size(480, 270), INTER_NEAREST);
+		}
+
 		//apply postprocessing
-		gpu::morphologyEx(Mask.first, Mask.first, CV_MOP_OPEN, getKernel(2));
-		gpu::morphologyEx(Mask.second, Mask.second, CV_MOP_OPEN, getKernel(1));
-		Mask.first.download(Mog_Mask);
-		Mask.second.download(Mog_Mask_shadow);
+		gpu::morphologyEx(Mask.first, Mask.first, CV_MOP_OPEN, getKernel(3));
+		gpu::morphologyEx(Mask.second, Mask.second, CV_MOP_OPEN, getKernel(2));
 
+		//watershead	
 		if (use_watershead){
-			if (!watershead_native_size){
-				// Eliminate noise and smaller objects
-				cv::Mat fg;
-				cv::erode(Mog_Mask, fg, cv::Mat(), cv::Point(-1, -1), 4); //3
+			// Eliminate noise and smaller objects
+			cv::gpu::GpuMat fg;
+			gpu::erode(Mask.first, fg, cv::Mat(), cv::Point(-1, -1), 2); //3
 
-				// Identify image pixels without objects
-				cv::Mat bg;
-				cv::dilate(Mog_Mask, bg, cv::Mat(), cv::Point(-1, -1), 4);
-				cv::threshold(Mog_Mask_shadow, Mog_Mask_shadow, 1, 128, cv::THRESH_BINARY_INV);
-				cv::threshold(bg, bg, 1, 128, cv::THRESH_BINARY_INV);
-				if (remove_shadow)
-					cv::bitwise_and(bg, Mog_Mask_shadow, bg);
+			// Identify image pixels without objects
+			gpu::GpuMat bg;
+			gpu::dilate(Mask.first, bg, cv::Mat(), cv::Point(-1, -1), 4);
+			gpu::threshold(Mask.second, Mask.second, 1, 128, cv::THRESH_BINARY_INV);
+			gpu::threshold(bg, bg, 1, 128, cv::THRESH_BINARY_INV);
 
-				// Create markers image
-				markers = (Mog_Mask.size(), CV_8U, cv::Scalar(0));
-				markers = fg + bg;
-				if (show_markers)
-					imshow("markers", markers);
+			if (remove_shadow)
+				gpu::bitwise_or(bg, Mask.second, bg);
+
+			// Create markers image
+			gpu::GpuMat markers_g;
+			gpu::add(fg, bg, markers_g);
+
+			if (watershead_native_size){
+				gpu::GpuMat temptemp;
+				gpu::resize(markers_g, temptemp, o_frame.size(), INTER_NEAREST); // on GPU you may use something else than LINEAR here...cubic for example
+				temptemp.download(markers);
+
+			}else{
+			markers_g.download(markers);
 			}
-			else{
-				// Eliminate noise and smaller objects
-				cv::gpu::GpuMat fg;
-				gpu::erode(Mask.first, fg, cv::Mat(), cv::Point(-1, -1), 3);
 
-				// Identify image pixels without objects
-				gpu::GpuMat bg;
-				gpu::dilate(Mask.first, bg, cv::Mat(), cv::Point(-1, -1), 4);
-				gpu::threshold(Mask.second, Mask.second, 1, 128, cv::THRESH_BINARY_INV);
-				gpu::threshold(bg, bg, 1, 128, cv::THRESH_BINARY_INV);
-				gpu::bitwise_and(bg, Mask.second, bg);
-
-				// Create markers image
-				gpu::GpuMat markers_g;
-				Mat markers;
-				gpu::add(fg, bg, markers_g);
-				if (!save_lowres)
-					gpu::resize(markers_g, markers_g, o_frame.size(), INTER_LINEAR); // on GPU you may use something else than LINEAR here...cubic for example
-				markers_g.download(markers);
-			}
 			//watershed segmentation
 			WatershedSegmenter segmenter;
 			segmenter.setMarkers(markers);
@@ -461,23 +556,56 @@ int main(){
 			}
 			else{
 				result = segmenter.process(r_frame);
-				if (!save_lowres)
-					resize(result, result, o_frame.size(), INTER_LINEAR); //ON CPU you may use something else than LINEAR here...cubic for example
+				resize(result, result, o_frame.size(), INTER_NEAREST); //ON CPU you may use something else than LINEAR here...cubic for example
 
 			}
 			result.convertTo(result, CV_8UC1);
 			if (show_result)
 				imshow("final_result", result);
 		}
-		else
-		{
+		else if (use_grabcut){
+			//grabcut
+			Mask.first.download(Mog_Mask);
+			gpu::GpuMat one;
+			gpu::GpuMat two;
+
+			gpu::morphologyEx(Mask.first, one, CV_MOP_DILATE, getKernel(10));
+			one.download(Mog_Mask_padded);
+			gpu::morphologyEx(Mask.first, two , CV_MOP_CLOSE, getKernel(10));
+			two.download(Mog_Mask_extrapadded);
+			Mask.second.download(Mog_Mask_shadow);
+
+			Mat use_mask = getGrabCutMask2(Mog_Mask, Mog_Mask_padded, Mog_Mask_extrapadded, Mog_Mask_shadow);
+			//imshow("input to GRABCUT",use_mask*255/3);
+			if (countNonZero(use_mask)>(thres*thres*0.4)){
+				//cout << r_frame.size() << endl;
+				//cout << use_mask.size() << endl;
+
+				grabCut(r_frame, use_mask, Rect(), bgModel, fgModel, 1, GC_INIT_WITH_MASK);
+				//cout << "im here 2 " << endl;
+				use_mask = (use_mask == 1) | (use_mask == 3); //make mask binary
+				resize(use_mask, use_mask, o_frame.size(), INTER_NEAREST);
+				result = use_mask.clone();
+			}
+		
+		}else{
 			//pure MOG2 output, discarded shadows as foreground. 
-			if (!save_lowres)
-				resize(Mog_Mask, Mog_Mask, o_frame.size(), INTER_LINEAR);
+			Mask.first.download(Mog_Mask);
+			resize(Mog_Mask, Mog_Mask, o_frame.size(), INTER_NEAREST);
 			result = Mog_Mask;
 			result.convertTo(result, CV_8UC1);
 			if (show_result)
 				imshow("final_result", result);
+		}
+
+		if (remove_grass){
+			Mat grass;
+			int sensitivity = 30;
+			cv::cvtColor(o_frame, grass, CV_BGR2HSV);
+			inRange(grass, Scalar(60 - sensitivity, 100, 50), Scalar(60 + sensitivity, 255, 255), grass);
+			//imshow("grass", grass);
+			result = result - grass;
+			result.setTo(0, result < 0);
 		}
 
 		if (post_open){
@@ -486,28 +614,33 @@ int main(){
 				imshow("final_result", result);
 		}
 
-		if (save_fg){
-			threshold(result, result, 130, 1, THRESH_BINARY);
-			if (!save_lowres){
-				o_frame.copyTo(result, result);
-			}
-			else{
-				r_frame.copyTo(result, result);
+		if (use_depth){
+			threshold(result, result, 155, 255, THRESH_BINARY);
+			vector<Rect> ROI = getROIs(result, o_frame, 0, 0);
+			vector<Rect> remove = DistanceEstimate(ROI, result, hor, thres);
+			for (int u = 0; u < remove.size(); u++){
+				result(remove[u]).setTo(0);
 			}
 			if (show_result)
 				imshow("final_result", result);
 		}
 
-		if (save_bg){
-			threshold(result, result, 130, 1, THRESH_BINARY_INV);
-			if (!save_lowres){
-				o_frame.copyTo(result, result);
-			}
-			else{
-				r_frame.copyTo(result, result);
-			}
+
+		if (save_fg){
+			Mat temp;
+			o_frame.copyTo(temp, result);
+			outputVideo << temp;
 			if (show_result)
-				imshow("final_result", result);
+				imshow("final_result", temp);
+		}
+
+		if (save_bg){
+			Mat temp = Mat::zeros(1920, 1080, CV_8U);
+			threshold(result, result, 130, 1, THRESH_BINARY_INV);
+			o_frame.copyTo(temp, result);
+			outputVideo << temp;
+			if (show_result)
+				imshow("final_result", temp);
 		}
 
 
@@ -516,7 +649,7 @@ int main(){
 		float fpt = 1 / pt;
 		fps=approxRollingAverage(fps, fpt, itter);
 
-		if (itter>500 && tv_average_smooth){ //dont save foreground or baclkgtound
+		if (itter>5 && tv_average_smooth){ //dont save foreground or baclkgtound
 			Mat temp;
 			if (countNonZero(secound) > 0){
 			third = secound;
@@ -541,27 +674,15 @@ int main(){
 
 		}
 
-		if (use_depth){
-			//Mat temp = Mat::zeros(result.size(), CV_8UC1);
-			//temp += result;
-			threshold(result, result, 155, 255, THRESH_BINARY);
-			vector<Rect> ROI = getROIs(result, r_frame, 0, 0);
-			vector<Rect> remove = DistanceEstimate(ROI, result, hor, thres);
-			for (int u = 0; u < remove.size(); u++){
-				result(remove[u]).setTo(0);
-			}
-			if (show_result)
-				imshow("final_result", result);
-		}
-
 		//demo
 		if (demo){
 			Mat bg, fg, not_result, output;
-			r_frame.copyTo(bg);			
-			line(bg, Point(0, 0), Point(RWIDTH, RHEIGHT), Scalar(255, 0, 0), 5);
-
+			o_frame.copyTo(bg);			
+			//line(bg, Point(0, 0), Point(RWIDTH, RHEIGHT), Scalar(255, 0, 0), 5);
+			bg.setTo(cv::Scalar(204, 0, 40), trace);
+			//bg = bg + trace;
 			bitwise_not(result, not_result);
-			r_frame.copyTo(fg, result);
+			o_frame.copyTo(fg, result);
 
 			//bg.setTo(0, result);
 			//fg.setTo(0, not_result);
@@ -572,17 +693,30 @@ int main(){
 			AlphaBlend(fg, bg, result);
 			//result = r_frame;
 			//result = bg;
+			outputVideo << bg;
 			if (show_result)
 				imshow("final_result", bg);
 		}
 
 		//write to video
-		if (record && itter> 500)
+		if (record && (itter >5) && !demo && !save_bg && !save_fg) //if (record && itter> 500)
 			outputVideo << result;
 			//outputVideo.write(result);
 
-		if (((itter%100) == 0 && save_result)){
-			imwrite("Data/Results/" + to_string(itter) + ".jpg", result);
+		if (((itter % 100) == 0 && save_result) || not_golf){
+			if (not_golf)
+				resize(result, result, Size(320, 240));
+			threshold(result, result, 200, 255, THRESH_BINARY);
+			imwrite("Data/new/" + to_string(itter) + ".jpg", result);
+			//imwrite("Data/new/" + to_string(itter) + "i.jpg", o_frame);
+
+
+		}
+
+		if (show_downscaled){
+			Mat temp;
+			resize(result, temp, Size(RWIDTH, RHEIGHT), INTER_NEAREST);
+			imshow("small results", temp);
 
 		}
 
